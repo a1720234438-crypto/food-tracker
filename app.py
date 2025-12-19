@@ -6,7 +6,7 @@ import time
 from supabase import create_client
 
 # --- 1. 页面配置 ---
-st.set_page_config(page_title="AI 饮食日记 (终极修复版)", page_icon="🛡️")
+st.set_page_config(page_title="AI 饮食日记 (2025未来版)", page_icon="🚀")
 
 # 检查配置
 if "gemini" not in st.secrets or "supabase" not in st.secrets:
@@ -29,27 +29,10 @@ def get_proxies():
         return {"http": p, "https": p}
     return None
 
-def check_available_models():
-    """
-    【诊断工具】查询当前 Key 支持的所有模型名字
-    """
-    api_key = st.secrets["gemini"]["api_key"]
-    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
-    proxies = get_proxies()
-    try:
-        resp = requests.get(url, proxies=proxies, timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            # 过滤出支持生成内容的模型
-            names = [m['name'].replace('models/', '') for m in data.get('models', []) if 'generateContent' in m['supportedGenerationMethods']]
-            return names
-        return []
-    except:
-        return []
-
 def call_gemini_api(image_bytes, mime_type, model_name):
     """发送请求"""
     api_key = st.secrets["gemini"]["api_key"]
+    # 使用 v1beta 接口
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
     
     base64_image = base64.b64encode(image_bytes).decode('utf-8')
@@ -57,7 +40,7 @@ def call_gemini_api(image_bytes, mime_type, model_name):
     payload = {
         "contents": [{
             "parts": [
-                {"text": "你是一个营养师。请识别图片食物，返回纯JSON：{\"food_name\":\"菜名\", \"calories\":整数热量, \"nutrients\":\"营养成分\", \"analysis\":\"简短评价\"}"},
+                {"text": "你是一个营养师。请识别图片食物，返回纯JSON（不要markdown格式）：{\"food_name\":\"菜名\", \"calories\":整数热量, \"nutrients\":\"营养成分\", \"analysis\":\"简短评价\"}"},
                 {"inline_data": {"mime_type": mime_type, "data": base64_image}}
             ]
         }]
@@ -68,7 +51,7 @@ def call_gemini_api(image_bytes, mime_type, model_name):
             url, 
             json=payload, 
             headers={"Content-Type": "application/json"}, 
-            timeout=50, # 延长超时时间
+            timeout=50, 
             proxies=get_proxies()
         )
         return response
@@ -77,23 +60,23 @@ def call_gemini_api(image_bytes, mime_type, model_name):
 
 def analyze_smartly(image_bytes, mime_type):
     """
-    智能分析：优先尝试 2.0，并带有重试机制
+    智能分析：适配你的 2.5 版本环境
     """
-    # 既然 2.0 存在但繁忙，我们把它放第一个，并只用最标准的名字
-    # 去掉了 -latest 等后缀，使用最纯粹的模型名
+    # 【核心修改】根据你的截图，使用了 2.5 和 2.0 系列
     models_candidates = [
-        "gemini-2.0-flash-exp", # 你截图里证明存在的模型
-        "gemini-1.5-pro",       # 尝试标准名 (无后缀)
-        "gemini-1.5-flash",     # 尝试标准名 (无后缀)
-        "gemini-pro-vision"     # 老版本保底
+        "gemini-2.5-pro",         # 截图里显示支持的最强模型！
+        "gemini-2.5-flash",       # 截图里显示的最快模型
+        "gemini-2.0-flash",       # 稳定版 2.0
+        "gemini-2.0-flash-exp",   # 之前的备用
+        "gemini-flash-latest"     # 通用别名保底
     ]
     
     last_debug_info = ""
 
     for model in models_candidates:
-        # 对每个模型尝试最多 2 次 (处理 429 繁忙)
+        # 增加重试机制，防止 429 繁忙
         for attempt in range(2): 
-            with st.status(f"尝试 {model} (第 {attempt+1} 次)...", expanded=False) as status:
+            with st.status(f"🚀 正在尝试旗舰模型: {model} ...", expanded=False) as status:
                 resp = call_gemini_api(image_bytes, mime_type, model)
                 
                 # 1. 网络挂了
@@ -107,22 +90,22 @@ def analyze_smartly(image_bytes, mime_type):
                         res_json = resp.json()
                         text = res_json['candidates'][0]['content']['parts'][0]['text']
                         clean_text = text.replace("```json", "").replace("```", "").strip()
-                        status.update(label=f"✅ {model} 成功！", state="complete")
+                        status.update(label=f"✅ {model} 识别成功！", state="complete")
                         return json.loads(clean_text)
                     except:
-                        pass # 解析失败就重试
+                        pass 
 
-                # 3. 繁忙 (429) -> 核心修复：等待并重试
+                # 3. 繁忙 (429) -> 等待并重试
                 elif resp.status_code == 429:
-                    status.update(label=f"⏳ {model} 繁忙，休息 3 秒...", state="running")
-                    time.sleep(3) # 强制休息
-                    continue # 继续下一次 attempt
+                    status.update(label=f"⏳ {model} 繁忙(429)，休息2秒...", state="running")
+                    time.sleep(2) 
+                    continue 
                 
-                # 4. 不存在 (404) -> 直接换下一个模型
+                # 4. 不存在 (404) -> 换下一个
                 elif resp.status_code == 404:
-                    status.update(label=f"❌ {model} 不存在，跳过", state="error")
-                    last_debug_info += f"\n{model}: 404 Not Found"
-                    break # 跳出 attempt 循环，换下一个 model
+                    status.update(label=f"❌ {model} 404跳过", state="error")
+                    last_debug_info += f"\n{model}: 404"
+                    break 
 
                 # 其他错误
                 else:
@@ -130,18 +113,9 @@ def analyze_smartly(image_bytes, mime_type):
                     last_debug_info += f"\n{model}: {resp.text}"
                     break
     
-    # 如果全挂了，运行诊断
-    st.error("❌ 所有模型均不可用。正在自动诊断...")
-    with st.spinner("正在查询你的 Key 支持哪些模型..."):
-        valid_models = check_available_models()
-    
-    if valid_models:
-        st.warning(f"🔍 你的 API Key 仅支持以下模型：\n\n" + ", ".join(valid_models))
-        st.info("请修改代码中的 `models_candidates` 列表，使用上面列出的名字。")
-    else:
-        st.error("诊断失败：无法获取模型列表。请检查网络或 Key 是否有效。")
-        if last_debug_info:
-            st.code(last_debug_info)
+    st.error("❌ 所有模型均不可用。请检查下方报错：")
+    if last_debug_info:
+        st.code(last_debug_info)
             
     return None
 
@@ -168,13 +142,16 @@ def save_to_db(data, url):
         return True
     except: return False
 
-st.title("🛡️ AI 饮食记录 (诊断修复版)")
+st.title("🚀 AI 饮食记录 (2.5 Pro版)")
+
+with st.sidebar:
+    st.info("已启用 Gemini 2.5 Pro 模型")
 
 uploaded_file = st.file_uploader("📸 拍照/上传", type=["jpg", "png", "jpeg", "webp"])
 
 if uploaded_file:
     st.image(uploaded_file, width=300)
-    if st.button("🚀 开始识别", type="primary"):
+    if st.button("✨ 立即识别", type="primary"):
         img_bytes = uploaded_file.getvalue()
         result = analyze_smartly(img_bytes, uploaded_file.type)
         
@@ -182,7 +159,7 @@ if uploaded_file:
             url = upload_img(img_bytes, uploaded_file.name, uploaded_file.type)
             if save_to_db(result, url):
                 st.balloons()
-                st.success(f"已记录：{result['food_name']}")
+                st.success(f"已记录：{result['food_name']} ({result['calories']} kcal)")
                 time.sleep(1)
                 st.rerun()
 
@@ -191,5 +168,6 @@ try:
     rows = supabase.table("meals").select("*").order("created_at", desc=True).limit(3).execute().data
     for row in rows:
         with st.container(border=True):
-            st.markdown(f"**{row['food_name']}** - {row['calories']} kcal")
+            st.markdown(f"**{row['food_name']}**")
+            st.caption(f"{row['calories']} kcal | {row['analysis']}")
 except: pass
