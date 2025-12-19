@@ -6,7 +6,7 @@ import time
 from supabase import create_client
 
 # --- 1. 初始化 ---
-st.set_page_config(page_title="AI 饮食日记", page_icon="🥑")
+st.set_page_config(page_title="AI 饮食日记", page_icon="🍱")
 
 if "gemini" not in st.secrets or "supabase" not in st.secrets:
     st.error("请配置 Secrets！")
@@ -23,15 +23,15 @@ except Exception as e:
 def analyze_image_http(image_bytes):
     api_key = st.secrets["gemini"]["api_key"]
     
-    # 【修正点】使用 -latest 后缀，强制指向最新版，解决 404 问题
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={api_key}"
+    # 【最后的核心修复】使用 v1 正式版接口和标准模型名
+    url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={api_key}"
     
     base64_image = base64.b64encode(image_bytes).decode('utf-8')
     
     payload = {
         "contents": [{
             "parts": [
-                {"text": "你是一个营养师。识别图片中的食物。请务必返回纯 JSON 格式：{\"food_name\": \"...\", \"calories\": 0, \"nutrients\": \"...\", \"analysis\": \"...\"}。如果不是食物，calories填0。不要使用Markdown格式。"},
+                {"text": "识别图中食物。只返回纯JSON: {\"food_name\":\"...\",\"calories\":0,\"nutrients\":\"...\",\"analysis\":\"...\"}"},
                 {
                     "inline_data": {
                         "mime_type": "image/jpeg",
@@ -45,27 +45,26 @@ def analyze_image_http(image_bytes):
     try:
         response = requests.post(url, json=payload, headers={"Content-Type": "application/json"})
         
-        # 调试信息：如果再报错，屏幕上会直接显示 Google 到底说了什么
         if response.status_code != 200:
-            st.error(f"API 报错 (代码 {response.status_code}): {response.text}")
+            # 报错时，直接显示最直观的错误原因
+            st.error(f"Google API 报错 ({response.status_code})")
+            with st.expander("点击查看具体错误原因"):
+                st.write(response.text)
             return None
             
-        result_json = response.json()
+        res_data = response.json()
         try:
-            # 尝试解析深层结构
-            if 'candidates' in result_json:
-                text_content = result_json['candidates'][0]['content']['parts'][0]['text']
-                text_content = text_content.replace("```json", "").replace("```", "").strip()
-                return json.loads(text_content)
-            else:
-                st.error(f"AI 返回了空数据: {result_json}")
-                return None
+            # 解析 Google 返回的深层文本
+            raw_text = res_data['candidates'][0]['content']['parts'][0]['text']
+            # 清理代码块标记
+            clean_json = raw_text.replace("```json", "").replace("```", "").strip()
+            return json.loads(clean_json)
         except Exception as e:
-            st.error(f"解析 JSON 失败: {e}")
+            st.error("AI 返回格式解析失败")
             return None
             
     except Exception as e:
-        st.error(f"网络连接失败: {e}")
+        st.error(f"网络请求失败: {e}")
         return None
 
 def upload_image(file_bytes, file_name):
@@ -90,34 +89,35 @@ def save_to_db(data, url):
     except:
         pass
 
-# --- 3. 界面 ---
-st.title("🥑 AI 饮食追踪")
+# --- 3. 页面 ---
+st.title("🍱 AI 饮食记录")
 
 with st.expander("➕ 记一笔", expanded=True):
-    up_file = st.file_uploader("拍照", type=["jpg", "png", "jpeg"])
+    up_file = st.file_uploader("拍一张照片", type=["jpg", "png", "jpeg"])
     
     if up_file and st.button("🚀 开始分析"):
-        with st.spinner("连接 Google..."):
-            bytes_data = up_file.getvalue()
-            result = analyze_image_http(bytes_data)
+        with st.spinner("正在呼叫 AI..."):
+            img_data = up_file.getvalue()
+            result = analyze_image_http(img_data)
             
             if result:
-                url = upload_image(bytes_data, up_file.name)
-                save_to_db(result, url)
-                st.success(f"已记录: {result['food_name']}")
+                img_url = upload_image(img_data, up_file.name)
+                save_to_db(result, img_url)
+                st.success(f"成功记录: {result['food_name']}")
                 time.sleep(1)
                 st.rerun()
 
 st.divider()
 try:
-    rows = supabase.table("meals").select("*").order("created_at", desc=True).limit(5).execute().data
+    rows = supabase.table("meals").select("*").order("created_at", desc=True).limit(10).execute().data
     for row in rows:
         with st.container(border=True):
-            c1, c2 = st.columns([1, 3])
+            c1, c2 = st.columns([1, 2])
             with c1:
                 if row['image_url']: st.image(row['image_url'])
             with c2:
-                st.markdown(f"**{row['food_name']}**")
-                st.caption(f"{row['calories']} kcal | {row['analysis']}")
+                st.subheader(row['food_name'])
+                st.write(f"🔥 {row['calories']} kcal")
+                st.caption(row['analysis'])
 except:
-    pass
+    st.info("这里将显示你的历史记录")
