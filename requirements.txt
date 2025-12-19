@@ -2,5 +2,5 @@ streamlit
 supabase
 python-dotenv
 Pillow
-google-generative-ai
 google-genai
+
