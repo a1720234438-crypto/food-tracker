@@ -1,22 +1,16 @@
 import streamlit as st
-import google.generativeai as genai
-from supabase import create_client
-from PIL import Image
+import requests
 import json
+import base64
 import time
+from supabase import create_client
 
-# --- 1. 初始化设置 ---
+# --- 1. 初始化 ---
 st.set_page_config(page_title="AI 饮食日记", page_icon="🥑")
 
+# 检查 Secrets
 if "gemini" not in st.secrets or "supabase" not in st.secrets:
-    st.error("Secrets 配置缺失！")
-    st.stop()
-
-# 【关键修改】使用最稳定的旧版 SDK 初始化方式
-try:
-    genai.configure(api_key=st.secrets["gemini"]["api_key"])
-except Exception as e:
-    st.error(f"API Key 配置出错: {e}")
+    st.error("请配置 Secrets！")
     st.stop()
 
 # 初始化 Supabase
@@ -26,47 +20,56 @@ except Exception as e:
     st.error(f"数据库连接失败: {e}")
     st.stop()
 
-# --- 2. 核心函数 ---
+# --- 2. 核心函数 (纯 HTTP 版) ---
 
-def analyze_image(image_bytes):
+def analyze_image_http(image_bytes):
     """
-    使用 google-generative-ai (稳定版) 进行分析
+    不使用 SDK，直接发 HTTP 请求给 Gemini API
     """
-    # 提示词：强制要求 JSON
-    prompt = """
-    你是一个营养师。请识别图片中的食物。
-    请直接返回标准的 JSON 格式数据，不要包含 Markdown 标记（如 ```json）。
-    必须包含以下字段：
-    {
-        "food_name": "食物名称",
-        "calories": 0 (整数热量),
-        "nutrients": "蛋白质/碳水/脂肪含量描述",
-        "analysis": "简短评价"
+    api_key = st.secrets["gemini"]["api_key"]
+    # 使用最基础的 flash 模型接口
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
+    
+    # 1. 把图片转成 Base64 编码
+    base64_image = base64.b64encode(image_bytes).decode('utf-8')
+    
+    # 2. 构造请求体
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": "你是一个营养师。识别图片中的食物。请务必返回纯 JSON 格式：{\"food_name\": \"...\", \"calories\": 0, \"nutrients\": \"...\", \"analysis\": \"...\"}。如果不是食物，calories填0。不要使用Markdown格式。"},
+                {
+                    "inline_data": {
+                        "mime_type": "image/jpeg",
+                        "data": base64_image
+                    }
+                }
+            ]
+        }]
     }
-    如果不是食物，calories 填 0，food_name 填 "未知"。
-    """
 
     try:
-        # 【关键修改】模型名称使用最通用的 'gemini-1.5-flash'
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        # 3. 发送请求
+        response = requests.post(url, json=payload, headers={"Content-Type": "application/json"})
         
-        # 调用接口
-        response = model.generate_content([
-            {'mime_type': 'image/jpeg', 'data': image_bytes},
-            prompt
-        ])
-        
-        # 清洗数据 (防止 AI 有时候还是加上了 ```json)
-        text_content = response.text.strip()
-        if text_content.startswith("```json"):
-            text_content = text_content[7:]
-        if text_content.endswith("```"):
-            text_content = text_content[:-3]
+        # 检查 HTTP 状态码
+        if response.status_code != 200:
+            st.error(f"API 请求失败 ({response.status_code}): {response.text}")
+            return None
             
-        return json.loads(text_content)
-        
+        # 4. 解析结果
+        result_json = response.json()
+        try:
+            text_content = result_json['candidates'][0]['content']['parts'][0]['text']
+            # 清洗可能存在的 Markdown 标记
+            text_content = text_content.replace("```json", "").replace("```", "").strip()
+            return json.loads(text_content)
+        except (KeyError, IndexError, json.JSONDecodeError) as e:
+            st.error(f"解析数据失败，AI 返回了奇怪的内容: {e}")
+            return None
+            
     except Exception as e:
-        st.error(f"AI 响应解析失败: {e}")
+        st.error(f"网络请求出错: {e}")
         return None
 
 def upload_image(file_bytes, file_name):
@@ -76,7 +79,7 @@ def upload_image(file_bytes, file_name):
         supabase.storage.from_(bucket_name).upload(path, file_bytes, {"content-type": "image/jpeg"})
         return f"{st.secrets['supabase']['url']}/storage/v1/object/public/{bucket_name}/{path}"
     except:
-        return None # 忽略上传错误，保证能显示结果
+        return None
 
 def save_to_db(data, url):
     try:
@@ -88,29 +91,26 @@ def save_to_db(data, url):
             "image_url": url
         }
         supabase.table("meals").insert(record).execute()
-    except Exception as e:
-        st.warning(f"保存数据库失败: {e}")
+    except:
+        pass
 
-# --- 3. 界面逻辑 ---
-st.title("🥑 AI 饮食追踪 (稳定版)")
+# --- 3. 界面 ---
+st.title("🥑 AI 饮食追踪 (HTTP版)")
 
 with st.expander("➕ 记一笔", expanded=True):
     up_file = st.file_uploader("拍照", type=["jpg", "png", "jpeg"])
     
     if up_file and st.button("🚀 开始分析"):
-        with st.spinner("正在识别..."):
+        with st.spinner("正在连接 Google..."):
             bytes_data = up_file.getvalue()
             
-            # 1. AI 分析
-            result = analyze_image(bytes_data)
+            # 调用 HTTP 函数
+            result = analyze_image_http(bytes_data)
             
             if result:
-                # 2. 上传 & 保存
                 url = upload_image(bytes_data, up_file.name)
                 save_to_db(result, url)
-                
-                # 3. 反馈
-                st.success(f"已记录: {result['food_name']} ({result['calories']} kcal)")
+                st.success(f"已记录: {result['food_name']}")
                 time.sleep(1)
                 st.rerun()
 
