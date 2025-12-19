@@ -1,4 +1,6 @@
 streamlit
 supabase
-google-generative-ai
+python-dotenv
 Pillow
+google-generative-ai
+google-genai
