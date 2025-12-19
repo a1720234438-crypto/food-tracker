@@ -8,32 +8,26 @@ from supabase import create_client
 # --- 1. 初始化 ---
 st.set_page_config(page_title="AI 饮食日记", page_icon="🥑")
 
-# 检查 Secrets
 if "gemini" not in st.secrets or "supabase" not in st.secrets:
     st.error("请配置 Secrets！")
     st.stop()
 
-# 初始化 Supabase
 try:
     supabase = create_client(st.secrets["supabase"]["url"], st.secrets["supabase"]["key"])
 except Exception as e:
     st.error(f"数据库连接失败: {e}")
     st.stop()
 
-# --- 2. 核心函数 (纯 HTTP 版) ---
+# --- 2. 核心函数 ---
 
 def analyze_image_http(image_bytes):
-    """
-    不使用 SDK，直接发 HTTP 请求给 Gemini API
-    """
     api_key = st.secrets["gemini"]["api_key"]
-    # 使用最基础的 flash 模型接口
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
     
-    # 1. 把图片转成 Base64 编码
+    # 【修正点】使用 -latest 后缀，强制指向最新版，解决 404 问题
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={api_key}"
+    
     base64_image = base64.b64encode(image_bytes).decode('utf-8')
     
-    # 2. 构造请求体
     payload = {
         "contents": [{
             "parts": [
@@ -49,27 +43,29 @@ def analyze_image_http(image_bytes):
     }
 
     try:
-        # 3. 发送请求
         response = requests.post(url, json=payload, headers={"Content-Type": "application/json"})
         
-        # 检查 HTTP 状态码
+        # 调试信息：如果再报错，屏幕上会直接显示 Google 到底说了什么
         if response.status_code != 200:
-            st.error(f"API 请求失败 ({response.status_code}): {response.text}")
+            st.error(f"API 报错 (代码 {response.status_code}): {response.text}")
             return None
             
-        # 4. 解析结果
         result_json = response.json()
         try:
-            text_content = result_json['candidates'][0]['content']['parts'][0]['text']
-            # 清洗可能存在的 Markdown 标记
-            text_content = text_content.replace("```json", "").replace("```", "").strip()
-            return json.loads(text_content)
-        except (KeyError, IndexError, json.JSONDecodeError) as e:
-            st.error(f"解析数据失败，AI 返回了奇怪的内容: {e}")
+            # 尝试解析深层结构
+            if 'candidates' in result_json:
+                text_content = result_json['candidates'][0]['content']['parts'][0]['text']
+                text_content = text_content.replace("```json", "").replace("```", "").strip()
+                return json.loads(text_content)
+            else:
+                st.error(f"AI 返回了空数据: {result_json}")
+                return None
+        except Exception as e:
+            st.error(f"解析 JSON 失败: {e}")
             return None
             
     except Exception as e:
-        st.error(f"网络请求出错: {e}")
+        st.error(f"网络连接失败: {e}")
         return None
 
 def upload_image(file_bytes, file_name):
@@ -95,16 +91,14 @@ def save_to_db(data, url):
         pass
 
 # --- 3. 界面 ---
-st.title("🥑 AI 饮食追踪 (HTTP版)")
+st.title("🥑 AI 饮食追踪")
 
 with st.expander("➕ 记一笔", expanded=True):
     up_file = st.file_uploader("拍照", type=["jpg", "png", "jpeg"])
     
     if up_file and st.button("🚀 开始分析"):
-        with st.spinner("正在连接 Google..."):
+        with st.spinner("连接 Google..."):
             bytes_data = up_file.getvalue()
-            
-            # 调用 HTTP 函数
             result = analyze_image_http(bytes_data)
             
             if result:
