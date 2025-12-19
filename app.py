@@ -9,15 +9,16 @@ from supabase import create_client
 st.set_page_config(page_title="AI 饮食日记", page_icon="🍱")
 
 # 检查配置
-if "gemini" not in st.secrets or "supabase" not in st.secrets:
-    st.error("请配置 .streamlit/secrets.toml 文件！")
+required_secrets = ["gemini", "supabase"]
+if not all(k in st.secrets for k in required_secrets):
+    st.error("❌ 请配置 .streamlit/secrets.toml 文件！需要 [gemini] 和 [supabase] 字段。")
     st.stop()
 
 # 初始化数据库
 try:
     supabase = create_client(st.secrets["supabase"]["url"], st.secrets["supabase"]["key"])
 except Exception as e:
-    st.error(f"数据库连接失败: {e}")
+    st.error(f"❌ 数据库连接失败: {e}")
     st.stop()
 
 # --- 2. 核心分析逻辑 ---
@@ -25,8 +26,8 @@ except Exception as e:
 def get_proxies():
     """
     获取代理配置。
-    如果你在本地运行且无法直连 Google，必须配置代理。
     """
+    # 检查 secrets 中是否有 proxy 配置
     if "proxy" in st.secrets and st.secrets["proxy"]["url"]:
         p = st.secrets["proxy"]["url"]
         return {"http": p, "https": p}
@@ -37,17 +38,20 @@ def call_gemini_api(image_bytes, mime_type, model_name):
     底层 API 调用：支持动态 MIME 类型和代理
     """
     api_key = st.secrets["gemini"]["api_key"]
+    # API 地址
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
     
+    # 图片转 Base64
     base64_image = base64.b64encode(image_bytes).decode('utf-8')
     
+    # 构造请求体
     payload = {
         "contents": [{
             "parts": [
-                {"text": "你是一个营养师。请识别图片中的食物，直接返回纯JSON格式（不要Markdown标记）：{\"food_name\":\"名称\", \"calories\":数字, \"nutrients\":\"简述\", \"analysis\":\"点评\"}"},
+                {"text": "你是一个营养师。请识别图片中的食物，直接返回纯JSON格式（不要Markdown标记，不要```json前缀）：{\"food_name\":\"名称\", \"calories\":数字, \"nutrients\":\"简述\", \"analysis\":\"点评\"}"},
                 {
                     "inline_data": {
-                        "mime_type": mime_type, # 【修复】动态使用传入的图片类型
+                        "mime_type": mime_type, # 动态使用传入的图片类型
                         "data": base64_image
                     }
                 }
@@ -63,14 +67,13 @@ def call_gemini_api(image_bytes, mime_type, model_name):
             json=payload, 
             headers={"Content-Type": "application/json"}, 
             timeout=30,
-            proxies=proxies # 【修复】加入代理
+            proxies=proxies # 使用代理
         )
         return response
     except requests.exceptions.ConnectionError:
-        # 伪造一个连接错误的响应对象以便后续处理
         class MockResp:
             status_code = -1
-            text = "连接失败：无法连接到 Google 服务器。如果你在国内，请检查 secrets.toml 中的代理配置 (proxy_url)。"
+            text = "无法连接到 Google 服务器。请检查 secrets.toml 中的 [proxy] url 配置是否正确。"
         return MockResp()
     except Exception as e:
         class MockResp:
@@ -80,75 +83,92 @@ def call_gemini_api(image_bytes, mime_type, model_name):
 
 def analyze_image_self_healing(image_bytes, mime_type):
     """
-    自愈式分析：如果一个模型失败，自动尝试另一个
+    自愈式分析：解决 404 和 429 问题
     """
-    # 尝试顺序：Flash (快且稳) -> Flash-8b (极速) -> 2.0 (新模型)
-    models_to_try = ["gemini-1.5-flash", "gemini-1.5-flash-8b", "gemini-2.0-flash"]
+    # 【核心修复】：使用带版本号的完整名称，避免 404
+    models_to_try = [
+        "gemini-1.5-flash-latest",    # 尝试最新版 Flash
+        "gemini-1.5-flash-001",       # 尝试稳定版 Flash (最保险)
+        "gemini-1.5-pro-latest",      # 尝试 Pro 模型
+        "gemini-2.0-flash-exp",       # 尝试 2.0 实验版
+    ]
     
     last_error_text = ""
+    error_summary = []
 
     for model in models_to_try:
-        with st.status(f"正在尝试使用 {model} 进行识别...", expanded=False) as status:
+        with st.status(f"正在尝试模型: {model} ...", expanded=False) as status:
             resp = call_gemini_api(image_bytes, mime_type, model)
             
-            # 1. 成功情况
+            # --- 情况 1: 成功 ---
             if resp.status_code == 200:
                 try:
                     res_data = resp.json()
-                    # 安全提取文本
                     if 'candidates' in res_data and res_data['candidates']:
                         raw_text = res_data['candidates'][0]['content']['parts'][0]['text']
-                        # 清理 Markdown 标记 (```json ... ```)
+                        # 清理 JSON 字符串
                         clean_text = raw_text.replace("```json", "").replace("```", "").strip()
-                        status.update(label=f"{model} 识别成功！", state="complete")
+                        status.update(label=f"✅ {model} 识别成功！", state="complete")
                         return json.loads(clean_text)
                     else:
-                        last_error_text = f"API 返回结构异常: {res_data}"
-                except json.JSONDecodeError:
-                    last_error_text = "JSON 解析失败，AI 返回了非标准格式"
+                        error_msg = f"API返回空数据"
+                        last_error_text = json.dumps(res_data)
                 except Exception as e:
-                    last_error_text = f"数据处理错误: {e}"
+                    error_msg = f"JSON解析失败: {e}"
+                    last_error_text = resp.text
 
-            # 2. 额度超限 (429)
+            # --- 情况 2: 额度已满 (429) ---
             elif resp.status_code == 429:
-                status.update(label=f"{model} 额度已满，切换下一模型...", state="error")
-                time.sleep(1)
-                continue
-            
-            # 3. 其他错误 (400, 403, 500 等)
+                error_msg = "额度已满 (429)"
+                status.update(label=f"⚠️ {model} 额度不足，休息2秒...", state="error")
+                time.sleep(2) 
+
+            # --- 情况 3: 找不到模型 (404) ---
+            elif resp.status_code == 404:
+                error_msg = "模型未找到 (404)"
+                status.update(label=f"❌ {model} 404不可用，尝试下一个...", state="error")
+                last_error_text = resp.text
+
+            # --- 其他错误 ---
             else:
-                last_error_text = resp.text # 保存 Google 返回的具体错误信息
-                status.update(label=f"{model} 失败 ({resp.status_code})", state="error")
-                # 如果是连接错误(-1)，直接中断循环，因为换模型也没用
-                if resp.status_code == -1:
-                    st.error(resp.text)
-                    return None
-                continue
+                error_msg = f"错误代码 {resp.status_code}"
+                last_error_text = resp.text
+                status.update(label=f"❌ {model} 失败: {resp.status_code}", state="error")
+            
+            # 记录错误以便最后显示
+            error_summary.append(f"{model}: {error_msg}")
+            
+            # 如果是连不上网，直接退出循环
+            if resp.status_code == -1:
+                st.error(f"网络连接错误：{resp.text}")
+                return None
     
-    # 如果循环结束还没返回，说明全失败了
-    st.error("❌ 所有 AI 模型均不可用。")
-    if last_error_text:
-        with st.expander("查看详细报错信息 (Debug)", expanded=True):
-            st.code(last_error_text, language="json")
+    # 如果循环结束还没返回
+    st.error("❌ 所有 AI 模型均尝试失败。")
+    with st.expander("🔍 查看详细调试信息"):
+        st.write("尝试过程：")
+        st.json(error_summary)
+        st.write("最后一次 API 返回的详细错误：")
+        st.code(last_error_text, language="json")
     return None
 
 # --- 3. 基础功能 ---
 def upload_img(file_bytes, name, mime_type):
-    # 生成唯一文件名
+    # 根据 mimetype 决定后缀
     ext = mime_type.split('/')[-1]
+    if ext == 'jpeg': ext = 'jpg'
+    
     path = f"{int(time.time())}_{name}"
-    # 简单的扩展名修正
-    if not path.endswith(f".{ext}"): 
+    if not path.endswith(f".{ext}"):
         path += f".{ext}"
         
     try:
         supabase.storage.from_("food-images").upload(path, file_bytes, {"content-type": mime_type})
-        # 拼接公开访问 URL (确保你的 Bucket 是 Public 的)
         project_url = st.secrets["supabase"]["url"]
         return f"{project_url}/storage/v1/object/public/food-images/{path}"
     except Exception as e:
-        st.warning(f"图片上传失败，但将继续保存记录: {e}")
-        return None
+        st.warning(f"⚠️ 图片上传云端失败 (可能是文件名重复或权限问题)，但不影响分析。错误: {e}")
+        return None # 返回 None，后续逻辑要处理
 
 def save_to_db(data, url):
     record = {
@@ -156,73 +176,73 @@ def save_to_db(data, url):
         "calories": data.get("calories", 0),
         "nutrients": data.get("nutrients", "无"),
         "analysis": data.get("analysis", "无"),
-        "image_url": url
+        "image_url": url if url else "" # 处理 url 为 None 的情况
     }
     try:
         supabase.table("meals").insert(record).execute()
         return True
     except Exception as e:
-        st.error(f"保存数据库失败: {e}")
+        st.error(f"❌ 保存数据库失败: {e}")
         return False
 
 # --- 4. UI 界面 ---
 st.title("🍱 AI 饮食记录")
 
-# 侧边栏显示状态
+# 侧边栏状态
 with st.sidebar:
-    st.write("🔧 系统状态")
+    st.write("🛠️ 系统配置")
     proxies = get_proxies()
     if proxies:
-        st.success(f"已启用代理: {proxies['http']}")
+        st.success(f"代理已开启: {proxies['http']}")
     else:
-        st.info("未使用代理 (云端部署无需代理)")
+        st.info("未使用代理 (适合云端/非大陆环境)")
 
-uploaded_file = st.file_uploader("拍一张照片", type=["jpg", "png", "jpeg", "webp"])
+uploaded_file = st.file_uploader("📸 拍一张照片或上传图片", type=["jpg", "png", "jpeg", "webp"])
 
 if uploaded_file:
-    # 显示图片
+    # 预览图片
     st.image(uploaded_file, width=300)
     
-    if st.button("🚀 识别并记录", type="primary"):
+    if st.button("🚀 开始识别", type="primary"):
         img_bytes = uploaded_file.getvalue()
-        mime_type = uploaded_file.type # 获取真实的 MIME 类型 (如 image/png)
+        mime_type = uploaded_file.type # 获取真实格式 (image/png 等)
         
-        # 1. 分析图片
+        # 1. 识别
         result = analyze_image_self_healing(img_bytes, mime_type)
         
         if result:
-            # 2. 上传图片
-            with st.spinner("正在保存图片..."):
+            # 2. 上传
+            with st.spinner("☁️ 正在保存图片到云端..."):
                 img_url = upload_img(img_bytes, uploaded_file.name, mime_type)
             
-            # 3. 写入数据库
+            # 3. 存库
             if save_to_db(result, img_url):
                 st.balloons()
-                st.success(f"✅ 已记录: {result['food_name']} ({result['calories']} kcal)")
-                time.sleep(1.5)
+                st.success(f"✅ 记录成功！{result['food_name']} - {result['calories']} 卡路里")
+                time.sleep(2)
                 st.rerun()
 
 st.divider()
-st.subheader("📝 最近记录")
+st.subheader("📅 历史记录")
 
-# 展示历史记录
+# 读取历史
 try:
     rows = supabase.table("meals").select("*").order("created_at", desc=True).limit(5).execute().data
     if not rows:
-        st.caption("暂无记录，快去上传第一顿饭吧！")
+        st.caption("还没有记录，快去上传第一顿饭吧！")
         
     for row in rows:
         with st.container(border=True):
             c1, c2 = st.columns([1, 3])
-            if row['image_url']: 
+            if row.get('image_url'): 
                 c1.image(row['image_url'], use_container_width=True)
             else:
-                c1.text("🖼️ 无图")
+                c1.text("🚫 图片未保存")
             
             with c2:
                 st.markdown(f"**{row['food_name']}**")
                 st.markdown(f"🔥 `{row['calories']} kcal`")
-                st.caption(f"💡 {row['analysis']}")
-                st.text(f"📊 {row['nutrients']}")
+                st.info(f"{row['analysis']}")
+                st.caption(f"营养成分: {row['nutrients']}")
 except Exception as e:
     st.error(f"读取历史记录失败: {e}")
