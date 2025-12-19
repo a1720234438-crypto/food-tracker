@@ -38,7 +38,7 @@ def analyze_image(image_bytes):
     try:
         # 调用 AI (配置更稳妥的 Schema)
         response = client.models.generate_content(
-            model="gemini-2.0-flash", 
+            model="gemini-1.5-flash", 
             contents=[
                 prompt,
                 types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
@@ -136,3 +136,4 @@ try:
                 st.caption(row['analysis'])
 except Exception:
     st.info("暂无数据")
+
